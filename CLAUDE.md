@@ -233,6 +233,7 @@ rtk gain --history | grep proxy
 | tee.rs | Full output recovery | Save raw output to file on failure, print hint for LLM re-read |
 | utils.rs | Shared utilities | Package manager detection, common formatting |
 | discover/ | Claude Code history analysis | Scan JSONL sessions, classify commands, report missed savings |
+| hook_intercept_cmd.rs | Native Read/Grep interception | MinimalFilter for Read, head_limit for Grep |
 
 ## Performance Constraints
 

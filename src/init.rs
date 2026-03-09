@@ -9,6 +9,9 @@ use crate::integrity;
 // Embedded hook script (guards before set -euo pipefail)
 const REWRITE_HOOK: &str = include_str!("../hooks/rtk-rewrite.sh");
 
+// Embedded intercept hook for Read/Grep native tools
+const INTERCEPT_HOOK: &str = include_str!("../hooks/rtk-hook-intercept.sh");
+
 // Embedded slim RTK awareness instructions
 const RTK_SLIM: &str = include_str!("../hooks/rtk-awareness.md");
 
@@ -191,6 +194,94 @@ fn prepare_hook_paths() -> Result<(PathBuf, PathBuf)> {
     Ok((hook_dir, hook_path))
 }
 
+/// Prepare intercept hook directory and return path
+fn prepare_intercept_hook_path() -> Result<PathBuf> {
+    let claude_dir = resolve_claude_dir()?;
+    let hook_dir = claude_dir.join("hooks");
+    fs::create_dir_all(&hook_dir)
+        .with_context(|| format!("Failed to create hook directory: {}", hook_dir.display()))?;
+    Ok(hook_dir.join("rtk-hook-intercept.sh"))
+}
+
+/// Write intercept hook file if missing or outdated, return true if changed
+#[cfg(unix)]
+fn ensure_intercept_hook_installed(hook_path: &Path, verbose: u8) -> Result<bool> {
+    let changed = if hook_path.exists() {
+        let existing = fs::read_to_string(hook_path)
+            .with_context(|| format!("Failed to read existing hook: {}", hook_path.display()))?;
+
+        if existing == INTERCEPT_HOOK {
+            if verbose > 0 {
+                eprintln!("Intercept hook already up to date: {}", hook_path.display());
+            }
+            false
+        } else {
+            fs::write(hook_path, INTERCEPT_HOOK)
+                .with_context(|| format!("Failed to write hook to {}", hook_path.display()))?;
+            if verbose > 0 {
+                eprintln!("Updated intercept hook: {}", hook_path.display());
+            }
+            true
+        }
+    } else {
+        fs::write(hook_path, INTERCEPT_HOOK)
+            .with_context(|| format!("Failed to write hook to {}", hook_path.display()))?;
+        if verbose > 0 {
+            eprintln!("Created intercept hook: {}", hook_path.display());
+        }
+        true
+    };
+
+    // Set executable permissions
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(hook_path, fs::Permissions::from_mode(0o755))
+        .with_context(|| format!("Failed to set hook permissions: {}", hook_path.display()))?;
+
+    Ok(changed)
+}
+
+/// Append Read and Grep matcher entries to PreToolUse array
+fn insert_intercept_hook_entries(root: &mut serde_json::Value, hook_command: &str) {
+    let root_obj = match root.as_object_mut() {
+        Some(obj) => obj,
+        None => {
+            *root = serde_json::json!({});
+            root.as_object_mut()
+                .expect("Just created object, must succeed")
+        }
+    };
+
+    let hooks = root_obj
+        .entry("hooks")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .expect("hooks must be an object");
+
+    let pre_tool_use = hooks
+        .entry("PreToolUse")
+        .or_insert_with(|| serde_json::json!([]))
+        .as_array_mut()
+        .expect("PreToolUse must be an array");
+
+    // Add Read matcher
+    pre_tool_use.push(serde_json::json!({
+        "matcher": "Read",
+        "hooks": [{
+            "type": "command",
+            "command": hook_command
+        }]
+    }));
+
+    // Add Grep matcher
+    pre_tool_use.push(serde_json::json!({
+        "matcher": "Grep",
+        "hooks": [{
+            "type": "command",
+            "command": hook_command
+        }]
+    }));
+}
+
 /// Write hook file if missing or outdated, return true if changed
 #[cfg(unix)]
 fn ensure_hook_installed(hook_path: &Path, verbose: u8) -> Result<bool> {
@@ -348,13 +439,15 @@ fn remove_hook_from_json(root: &mut serde_json::Value) -> bool {
         None => return false,
     };
 
-    // Find and remove RTK entry
+    // Find and remove RTK entries (both rewrite and intercept hooks)
     let original_len = pre_tool_use_array.len();
     pre_tool_use_array.retain(|entry| {
         if let Some(hooks_array) = entry.get("hooks").and_then(|h| h.as_array()) {
             for hook in hooks_array {
                 if let Some(command) = hook.get("command").and_then(|c| c.as_str()) {
-                    if command.contains("rtk-rewrite.sh") {
+                    if command.contains("rtk-rewrite.sh")
+                        || command.contains("rtk-hook-intercept.sh")
+                    {
                         return false; // Remove this entry
                     }
                 }
@@ -419,12 +512,23 @@ pub fn uninstall(global: bool, verbose: u8) -> Result<()> {
     let claude_dir = resolve_claude_dir()?;
     let mut removed = Vec::new();
 
-    // 1. Remove hook file
+    // 1. Remove hook files
     let hook_path = claude_dir.join("hooks").join("rtk-rewrite.sh");
     if hook_path.exists() {
         fs::remove_file(&hook_path)
             .with_context(|| format!("Failed to remove hook: {}", hook_path.display()))?;
         removed.push(format!("Hook: {}", hook_path.display()));
+    }
+
+    let intercept_hook_path = claude_dir.join("hooks").join("rtk-hook-intercept.sh");
+    if intercept_hook_path.exists() {
+        fs::remove_file(&intercept_hook_path).with_context(|| {
+            format!(
+                "Failed to remove intercept hook: {}",
+                intercept_hook_path.display()
+            )
+        })?;
+        removed.push(format!("Intercept hook: {}", intercept_hook_path.display()));
     }
 
     // 1b. Remove integrity hash file
@@ -482,9 +586,14 @@ pub fn uninstall(global: bool, verbose: u8) -> Result<()> {
     Ok(())
 }
 
-/// Orchestrator: patch settings.json with RTK hook
+/// Orchestrator: patch settings.json with RTK hooks (rewrite + intercept)
 /// Handles reading, checking, prompting, merging, backing up, and atomic writing
-fn patch_settings_json(hook_path: &Path, mode: PatchMode, verbose: u8) -> Result<PatchResult> {
+fn patch_settings_json(
+    hook_path: &Path,
+    intercept_hook_path: Option<&Path>,
+    mode: PatchMode,
+    verbose: u8,
+) -> Result<PatchResult> {
     let claude_dir = resolve_claude_dir()?;
     let settings_path = claude_dir.join("settings.json");
     let hook_command = hook_path
@@ -506,10 +615,23 @@ fn patch_settings_json(hook_path: &Path, mode: PatchMode, verbose: u8) -> Result
         serde_json::json!({})
     };
 
-    // Check idempotency
-    if hook_already_present(&root, &hook_command) {
+    // Check if rewrite hook already present
+    let rewrite_present = hook_already_present(&root, hook_command);
+
+    // Check if intercept hooks already present
+    let intercept_present = if let Some(intercept_path) = intercept_hook_path {
+        let intercept_command = intercept_path
+            .to_str()
+            .context("Intercept hook path contains invalid UTF-8")?;
+        intercept_hooks_already_present(&root, intercept_command)
+    } else {
+        true // No intercept hook to install
+    };
+
+    // If both already present, nothing to do
+    if rewrite_present && intercept_present {
         if verbose > 0 {
-            eprintln!("settings.json: hook already present");
+            eprintln!("settings.json: all hooks already present");
         }
         return Ok(PatchResult::AlreadyPresent);
     }
@@ -531,8 +653,20 @@ fn patch_settings_json(hook_path: &Path, mode: PatchMode, verbose: u8) -> Result
         }
     }
 
-    // Deep-merge hook
-    insert_hook_entry(&mut root, &hook_command);
+    // Deep-merge rewrite hook (if not already present)
+    if !rewrite_present {
+        insert_hook_entry(&mut root, hook_command);
+    }
+
+    // Deep-merge intercept hooks (if not already present)
+    if !intercept_present {
+        if let Some(intercept_path) = intercept_hook_path {
+            let intercept_command = intercept_path
+                .to_str()
+                .context("Intercept hook path contains invalid UTF-8")?;
+            insert_intercept_hook_entries(&mut root, intercept_command);
+        }
+    }
 
     // Backup original
     if settings_path.exists() {
@@ -549,7 +683,7 @@ fn patch_settings_json(hook_path: &Path, mode: PatchMode, verbose: u8) -> Result
         serde_json::to_string_pretty(&root).context("Failed to serialize settings.json")?;
     atomic_write(&settings_path, &serialized)?;
 
-    println!("\n  settings.json: hook added");
+    println!("\n  settings.json: hooks added");
     if settings_path.with_extension("json.bak").exists() {
         println!(
             "  Backup: {}",
@@ -631,7 +765,7 @@ fn insert_hook_entry(root: &mut serde_json::Value, hook_command: &str) {
 }
 
 /// Check if RTK hook is already present in settings.json
-/// Matches on rtk-rewrite.sh substring to handle different path formats
+/// Matches on rtk-rewrite.sh or rtk-hook-intercept.sh substring to handle different path formats
 fn hook_already_present(root: &serde_json::Value, hook_command: &str) -> bool {
     let pre_tool_use_array = match root
         .get("hooks")
@@ -648,10 +782,57 @@ fn hook_already_present(root: &serde_json::Value, hook_command: &str) -> bool {
         .flatten()
         .filter_map(|hook| hook.get("command")?.as_str())
         .any(|cmd| {
-            // Exact match OR both contain rtk-rewrite.sh
+            // Exact match OR both contain the same hook filename
             cmd == hook_command
                 || (cmd.contains("rtk-rewrite.sh") && hook_command.contains("rtk-rewrite.sh"))
+                || (cmd.contains("rtk-hook-intercept.sh")
+                    && hook_command.contains("rtk-hook-intercept.sh"))
         })
+}
+
+/// Check if intercept hook entries are present for both Read and Grep matchers
+fn intercept_hooks_already_present(root: &serde_json::Value, hook_command: &str) -> bool {
+    let pre_tool_use_array = match root
+        .get("hooks")
+        .and_then(|h| h.get("PreToolUse"))
+        .and_then(|p| p.as_array())
+    {
+        Some(arr) => arr,
+        None => return false,
+    };
+
+    let mut has_read = false;
+    let mut has_grep = false;
+
+    for entry in pre_tool_use_array {
+        let matcher = entry.get("matcher").and_then(|m| m.as_str()).unwrap_or("");
+        let has_intercept_hook = entry
+            .get("hooks")
+            .and_then(|h| h.as_array())
+            .map(|hooks| {
+                hooks.iter().any(|hook| {
+                    hook.get("command")
+                        .and_then(|c| c.as_str())
+                        .map(|cmd| {
+                            cmd == hook_command
+                                || (cmd.contains("rtk-hook-intercept.sh")
+                                    && hook_command.contains("rtk-hook-intercept.sh"))
+                        })
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false);
+
+        if has_intercept_hook {
+            match matcher {
+                "Read" => has_read = true,
+                "Grep" => has_grep = true,
+                _ => {}
+            }
+        }
+    }
+
+    has_read && has_grep
 }
 
 /// Default mode: hook + slim RTK.md + @RTK.md reference
@@ -674,9 +855,13 @@ fn run_default_mode(global: bool, patch_mode: PatchMode, verbose: u8) -> Result<
     let rtk_md_path = claude_dir.join("RTK.md");
     let claude_md_path = claude_dir.join("CLAUDE.md");
 
-    // 1. Prepare hook directory and install hook
+    // 1. Prepare hook directory and install hooks
     let (_hook_dir, hook_path) = prepare_hook_paths()?;
     let hook_changed = ensure_hook_installed(&hook_path, verbose)?;
+
+    // 1b. Install intercept hook for Read/Grep
+    let intercept_hook_path = prepare_intercept_hook_path()?;
+    let intercept_changed = ensure_intercept_hook_installed(&intercept_hook_path, verbose)?;
 
     // 2. Write RTK.md
     write_if_changed(&rtk_md_path, RTK_SLIM, "RTK.md", verbose)?;
@@ -685,23 +870,25 @@ fn run_default_mode(global: bool, patch_mode: PatchMode, verbose: u8) -> Result<
     let migrated = patch_claude_md(&claude_md_path, verbose)?;
 
     // 4. Print success message
-    let hook_status = if hook_changed {
+    let hook_status = if hook_changed || intercept_changed {
         "installed/updated"
     } else {
         "already up to date"
     };
-    println!("\nRTK hook {} (global).\n", hook_status);
+    println!("\nRTK hooks {} (global).\n", hook_status);
     println!("  Hook:      {}", hook_path.display());
+    println!("  Intercept: {}", intercept_hook_path.display());
     println!("  RTK.md:    {} (10 lines)", rtk_md_path.display());
     println!("  CLAUDE.md: @RTK.md reference added");
 
     if migrated {
-        println!("\n  ✅ Migrated: removed 137-line RTK block from CLAUDE.md");
+        println!("\n  Migrated: removed 137-line RTK block from CLAUDE.md");
         println!("              replaced with @RTK.md (10 lines)");
     }
 
-    // 5. Patch settings.json
-    let patch_result = patch_settings_json(&hook_path, patch_mode, verbose)?;
+    // 5. Patch settings.json (rewrite + intercept hooks)
+    let patch_result =
+        patch_settings_json(&hook_path, Some(&intercept_hook_path), patch_mode, verbose)?;
 
     // Report result
     match patch_result {
@@ -709,7 +896,7 @@ fn run_default_mode(global: bool, patch_mode: PatchMode, verbose: u8) -> Result<
             // Already printed by patch_settings_json
         }
         PatchResult::AlreadyPresent => {
-            println!("\n  settings.json: hook already present");
+            println!("\n  settings.json: all hooks already present");
             println!("  Restart Claude Code. Test with: git status");
         }
         PatchResult::Declined | PatchResult::Skipped => {
@@ -731,28 +918,34 @@ fn run_hook_only_mode(_global: bool, _patch_mode: PatchMode, _verbose: u8) -> Re
 #[cfg(unix)]
 fn run_hook_only_mode(global: bool, patch_mode: PatchMode, verbose: u8) -> Result<()> {
     if !global {
-        eprintln!("⚠️  Warning: --hook-only only makes sense with --global");
+        eprintln!("Warning: --hook-only only makes sense with --global");
         eprintln!("    For local projects, use default mode or --claude-md");
         return Ok(());
     }
 
-    // Prepare and install hook
+    // Prepare and install hooks
     let (_hook_dir, hook_path) = prepare_hook_paths()?;
     let hook_changed = ensure_hook_installed(&hook_path, verbose)?;
 
-    let hook_status = if hook_changed {
+    // Install intercept hook for Read/Grep
+    let intercept_hook_path = prepare_intercept_hook_path()?;
+    let intercept_changed = ensure_intercept_hook_installed(&intercept_hook_path, verbose)?;
+
+    let hook_status = if hook_changed || intercept_changed {
         "installed/updated"
     } else {
         "already up to date"
     };
-    println!("\nRTK hook {} (hook-only mode).\n", hook_status);
-    println!("  Hook: {}", hook_path.display());
+    println!("\nRTK hooks {} (hook-only mode).\n", hook_status);
+    println!("  Hook:      {}", hook_path.display());
+    println!("  Intercept: {}", intercept_hook_path.display());
     println!(
         "  Note: No RTK.md created. Claude won't know about meta commands (gain, discover, proxy)."
     );
 
-    // Patch settings.json
-    let patch_result = patch_settings_json(&hook_path, patch_mode, verbose)?;
+    // Patch settings.json (rewrite + intercept hooks)
+    let patch_result =
+        patch_settings_json(&hook_path, Some(&intercept_hook_path), patch_mode, verbose)?;
 
     // Report result
     match patch_result {
@@ -760,7 +953,7 @@ fn run_hook_only_mode(global: bool, patch_mode: PatchMode, verbose: u8) -> Resul
             // Already printed by patch_settings_json
         }
         PatchResult::AlreadyPresent => {
-            println!("\n  settings.json: hook already present");
+            println!("\n  settings.json: all hooks already present");
             println!("  Restart Claude Code. Test with: git status");
         }
         PatchResult::Declined | PatchResult::Skipped => {

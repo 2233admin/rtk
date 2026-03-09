@@ -47,11 +47,16 @@ breakage, but future rule additions won't take effect until they migrate.
   - Supports compound commands (`&&`, `||`, `;`, `|`, `&`) and env prefixes
 * **discover**: extract rules/patterns into `src/discover/rules.rs` — adding a command now means editing one file only
 * **fix**: add `aws` and `psql` to rewrite registry (were missing despite modules existing since 0.24.0)
+* **hook-intercept**: intercept native Claude Code Read/Grep tools for token savings
+  - Read: MinimalFilter strips comments → write temp file → redirect via `updatedInput`
+  - Grep: inject `head_limit: 50` when not set → cap result flooding
+  - New `hooks/rtk-hook-intercept.sh` thin delegator (auto-installed by `rtk init`)
+  - Configurable via `[hook_intercept]` in config.toml
 
 ### Tests
 
-* +48 regression tests covering all command categories: aws, psql, Python, Go, JS/TS,
-  compound operators, sudo/env prefixes, registry invariants (607 total, was 559)
+* +63 regression tests covering all command categories: aws, psql, Python, Go, JS/TS,
+  compound operators, sudo/env prefixes, registry invariants, hook-intercept (622 total, was 559)
 
 ## [0.24.0](https://github.com/rtk-ai/rtk/compare/v0.23.0...v0.24.0) (2026-03-04)
 

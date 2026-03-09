@@ -20,6 +20,7 @@ mod go_cmd;
 mod golangci_cmd;
 mod grep_cmd;
 mod hook_audit_cmd;
+mod hook_intercept_cmd;
 mod init;
 mod integrity;
 mod json_cmd;
@@ -612,6 +613,14 @@ enum Commands {
         /// Raw command to rewrite (e.g. "git status", "cargo test && git push")
         cmd: String,
     },
+
+    /// Intercept native Read/Grep tools for token savings (PreToolUse hook)
+    ///
+    /// Reads PreToolUse JSON from stdin, applies filtering (Read) or
+    /// parameter injection (Grep), and emits hookSpecificOutput JSON.
+    /// Used by the rtk-hook-intercept.sh hook script.
+    #[command(name = "hook-intercept")]
+    HookIntercept,
 }
 
 #[derive(Subcommand)]
@@ -937,6 +946,7 @@ const RTK_META_COMMANDS: &[&str] = &[
     "config",
     "proxy",
     "hook-audit",
+    "hook-intercept",
     "cc-economics",
 ];
 
@@ -1695,6 +1705,10 @@ fn main() -> Result<()> {
             rewrite_cmd::run(&cmd)?;
         }
 
+        Commands::HookIntercept => {
+            hook_intercept_cmd::run()?;
+        }
+
         Commands::Proxy { args } => {
             use std::process::Command;
 
@@ -1984,6 +1998,7 @@ mod tests {
             vec!["rtk", "config"],
             vec!["rtk", "proxy", "echo", "hi"],
             vec!["rtk", "hook-audit"],
+            vec!["rtk", "hook-intercept"],
             vec!["rtk", "cc-economics"],
         ];
         for args in &meta_cmds_that_parse {

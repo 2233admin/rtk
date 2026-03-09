@@ -14,6 +14,8 @@ pub struct Config {
     pub tee: crate::tee::TeeConfig,
     #[serde(default)]
     pub telemetry: TelemetryConfig,
+    #[serde(default)]
+    pub hook_intercept: HookInterceptConfig,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -69,6 +71,27 @@ impl Default for FilterConfig {
                 "vendor".into(),
             ],
             ignore_files: vec!["*.lock".into(), "*.min.js".into(), "*.min.css".into()],
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct HookInterceptConfig {
+    pub read_enabled: bool,
+    pub grep_enabled: bool,
+    pub read_max_file_size: usize,
+    pub read_min_file_lines: usize,
+    pub grep_default_head_limit: usize,
+}
+
+impl Default for HookInterceptConfig {
+    fn default() -> Self {
+        Self {
+            read_enabled: true,
+            grep_enabled: true,
+            read_max_file_size: 1_048_576, // 1MB
+            read_min_file_lines: 100,
+            grep_default_head_limit: 50,
         }
     }
 }

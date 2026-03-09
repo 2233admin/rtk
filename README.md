@@ -402,7 +402,12 @@ rtk init -g --uninstall     # Remove all RTK artifacts
 ```
 
 **What is settings.json?**
-Claude Code configuration file that registers the RTK hook. The hook transparently rewrites commands (e.g., `git status` → `rtk git status`) before execution. Without this registration, Claude won't use the hook.
+Claude Code configuration file that registers RTK hooks:
+- **Bash hook**: transparently rewrites commands (e.g., `git status` → `rtk git status`)
+- **Read hook**: applies MinimalFilter to source files (strips comments, 15-40% savings)
+- **Grep hook**: injects `head_limit: 50` to cap large result sets
+
+Without this registration, Claude won't use the hooks.
 
 **Backup Behavior**:
 RTK creates `~/.claude/settings.json.bak` before making changes. If something breaks, restore with:
