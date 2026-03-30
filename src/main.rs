@@ -1973,8 +1973,24 @@ fn main() -> Result<()> {
                     playwright_cmd::run(&args[1..], cli.verbose)?;
                 }
                 _ => {
-                    // Generic passthrough with npm boilerplate filter
-                    npm_cmd::run(&args, cli.verbose, cli.skip_env)?;
+                    // Unknown npx package: passthrough directly to npx.
+                    // Do NOT route through npm_cmd — it injects "run" and
+                    // treats the package name as an npm script, which turns
+                    // e.g. `rtk npx netlify status` into `npm run netlify`.
+                    let timer = core::tracking::TimedExecution::start();
+                    let mut cmd = core::utils::resolved_command("npx");
+                    for arg in &args {
+                        cmd.arg(arg);
+                    }
+                    let status = cmd.status().context("Failed to run npx")?;
+                    let args_str = args.join(" ");
+                    timer.track_passthrough(
+                        &format!("npx {}", args_str),
+                        &format!("rtk npx {} (passthrough)", args_str),
+                    );
+                    if !status.success() {
+                        std::process::exit(status.code().unwrap_or(1));
+                    }
                 }
             }
         }
@@ -2599,4 +2615,45 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn test_npx_unknown_cmd_is_not_npm_run() {
+        // Regression: rtk npx <unknown-pkg> must NOT route through npm_cmd.
+        // npm_cmd injects 'run', turning e.g. 'rtk npx netlify status' into
+        // 'npm run netlify status'. Unknown npx packages should passthrough.
+        //
+        // We verify by checking the Cli parses 'npx netlify status' as
+        // Commands::Npx (not Commands::Npm), and that the first arg is the
+        // package name, not injected 'run'.
+        let result = Cli::try_parse_from(["rtk", "npx", "netlify", "status"]);
+        assert!(result.is_ok(), "rtk npx netlify status should parse");
+        if let Ok(cli) = result {
+            match cli.command {
+                Commands::Npx { ref args } => {
+                    assert_eq!(args[0], "netlify", "first arg must be package name, not 'run'");
+                    assert_eq!(args[1], "status");
+                }
+                _ => panic!("expected Npx command, got something else"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_npx_known_cmds_still_route() {
+        // Sanity check: known commands (tsc, eslint, prisma, next, prettier, playwright)
+        // must still parse as Commands::Npx with the correct first arg.
+        for pkg in &["tsc", "eslint", "prisma", "next", "prettier", "playwright"] {
+            let result = Cli::try_parse_from(["rtk", "npx", pkg, "--help"]);
+            assert!(result.is_ok(), "rtk npx {} --help should parse", pkg);
+            if let Ok(cli) = result {
+                match cli.command {
+                    Commands::Npx { ref args } => {
+                        assert_eq!(&args[0], pkg);
+                    }
+                    _ => panic!("expected Npx for {}", pkg),
+                }
+            }
+        }
+    }
+
 }
