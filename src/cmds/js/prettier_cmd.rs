@@ -64,12 +64,11 @@ pub fn filter_prettier_output(output: &str) -> String {
         }
 
         // Count total files checked
-        if trimmed.contains("All matched files use Prettier") {
-            if let Some(count_str) = trimmed.split_whitespace().next() {
-                if let Ok(count) = count_str.parse::<usize>() {
-                    files_checked = count;
-                }
-            }
+        if trimmed.contains("All matched files use Prettier")
+            && let Some(count_str) = trimmed.split_whitespace().next()
+            && let Ok(count) = count_str.parse::<usize>()
+        {
+            files_checked = count;
         }
     }
 
@@ -94,7 +93,6 @@ pub fn filter_prettier_output(output: &str) -> String {
                 "Prettier: {} files need formatting\n",
                 files_to_format.len()
             ));
-            result.push_str("═══════════════════════════════════════\n");
 
             const MAX_PRETTIER_FILES: usize = CAP_WARNINGS;
             for (i, file) in files_to_format.iter().take(MAX_PRETTIER_FILES).enumerate() {

@@ -6,22 +6,21 @@
 use crate::core::runner::{self, RunOptions};
 use crate::core::truncate::CAP_LIST;
 use crate::core::utils::{ok_confirmation, resolved_command, truncate};
-use crate::git;
+use crate::git_cmd;
 use anyhow::Result;
-use lazy_static::lazy_static;
 use regex::Regex;
 use serde_json::Value;
 use std::process::Command;
+use std::sync::LazyLock;
 
-lazy_static! {
-    static ref HTML_COMMENT_RE: Regex = Regex::new(r"(?s)<!--.*?-->").unwrap();
-    static ref BADGE_LINE_RE: Regex =
-        Regex::new(r"(?m)^\s*\[!\[[^\]]*\]\([^)]*\)\]\([^)]*\)\s*$").unwrap();
-    static ref IMAGE_ONLY_LINE_RE: Regex = Regex::new(r"(?m)^\s*!\[[^\]]*\]\([^)]*\)\s*$").unwrap();
-    static ref HORIZONTAL_RULE_RE: Regex =
-        Regex::new(r"(?m)^\s*(?:---+|\*\*\*+|___+)\s*$").unwrap();
-    static ref MULTI_BLANK_RE: Regex = Regex::new(r"\n{3,}").unwrap();
-}
+static HTML_COMMENT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?s)<!--.*?-->").unwrap());
+static BADGE_LINE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?m)^\s*\[!\[[^\]]*\]\([^)]*\)\]\([^)]*\)\s*$").unwrap());
+static IMAGE_ONLY_LINE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?m)^\s*!\[[^\]]*\]\([^)]*\)\s*$").unwrap());
+static HORIZONTAL_RULE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?m)^\s*(?:---+|\*\*\*+|___+)\s*$").unwrap());
+static MULTI_BLANK_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\n{3,}").unwrap());
 
 /// Filter markdown body to remove noise while preserving meaningful content.
 /// Removes HTML comments, badge lines, image-only lines, horizontal rules,
@@ -162,6 +161,16 @@ fn extract_identifier_and_extra_args(args: &[String]) -> Option<(String, Vec<Str
     identifier.map(|id| (id, extra))
 }
 
+/// Like `extract_identifier_and_extra_args` but yields `(None, args.to_vec())` when no
+/// positional identifier is present, so callers can defer the "id required" decision
+/// to `gh` itself (e.g. `gh pr view` defaults to the current branch's PR).
+fn parse_optional_identifier(args: &[String]) -> (Option<String>, Vec<String>) {
+    match extract_identifier_and_extra_args(args) {
+        Some((id, extra)) => (Some(id), extra),
+        None => (None, args.to_vec()),
+    }
+}
+
 fn run_gh_json<F>(cmd: Command, label: &str, filter_fn: F) -> Result<i32>
 where
     F: Fn(&Value) -> String,
@@ -258,7 +267,13 @@ fn format_pr_list(json: &Value, ultra_compact: bool) -> String {
             let state = pr["state"].as_str().unwrap_or("???");
             let author = pr["author"]["login"].as_str().unwrap_or("???");
             let icon = state_icon(state, ultra_compact);
-            format!("  {} #{} {} ({})", icon, number, truncate(title, 60), author)
+            format!(
+                "  {} #{} {} ({})",
+                icon,
+                number,
+                truncate(title, 60),
+                author
+            )
         })
         .collect();
     const MAX_LIST: usize = CAP_LIST;
@@ -268,7 +283,8 @@ fn format_pr_list(json: &Value, ultra_compact: bool) -> String {
     if all_lines.len() > MAX_LIST {
         out.push_str(&format!("  … +{} more\n", all_lines.len() - MAX_LIST));
         let all_text = all_lines.join("\n");
-        if let Some(hint) = crate::core::tee::force_tee_tail_hint(&all_text, "gh-prs", MAX_LIST + 1) {
+        if let Some(hint) = crate::core::tee::force_tee_tail_hint(&all_text, "gh-prs", MAX_LIST + 1)
+        {
             out.push_str(&format!("  {}\n", hint));
         }
     }
@@ -319,27 +335,32 @@ fn pr_status_json_fields() -> &'static str {
 }
 
 fn view_pr(args: &[String], _verbose: u8, ultra_compact: bool) -> Result<i32> {
-    let (pr_number, extra_args) = match extract_identifier_and_extra_args(args) {
-        Some(result) => result,
-        None => return Err(anyhow::anyhow!("PR number required")),
-    };
+    // `gh pr view` without an identifier defaults to the PR for the current branch.
+    let (pr_number_opt, extra_args) = parse_optional_identifier(args);
     if should_passthrough_pr_view(&extra_args) {
-        return run_passthrough_with_extra("gh", &["pr", "view", &pr_number], &extra_args);
+        let mut base: Vec<&str> = vec!["pr", "view"];
+        if let Some(id) = pr_number_opt.as_deref() {
+            base.push(id);
+        }
+        return run_passthrough_with_extra("gh", &base, &extra_args);
     }
     let mut cmd = resolved_command("gh");
+    cmd.args(["pr", "view"]);
+    if let Some(id) = pr_number_opt.as_deref() {
+        cmd.arg(id);
+    }
     cmd.args([
-        "pr",
-        "view",
-        &pr_number,
         "--json",
         "number,title,state,author,body,url,mergeable,reviews,statusCheckRollup",
     ]);
     for arg in &extra_args {
         cmd.arg(arg);
     }
-    run_gh_json(cmd, &format!("pr view {}", pr_number), |json| {
-        format_pr_view(json, ultra_compact)
-    })
+    let label = match pr_number_opt.as_deref() {
+        Some(id) => format!("pr view {}", id),
+        None => "pr view".to_string(),
+    };
+    run_gh_json(cmd, &label, |json| format_pr_view(json, ultra_compact))
 }
 
 fn format_pr_view(json: &Value, ultra_compact: bool) -> String {
@@ -411,15 +432,17 @@ fn format_pr_view(json: &Value, ultra_compact: bool) -> String {
 
     out.push_str(&format!("  {}\n", url));
 
-    if let Some(body) = json["body"].as_str() {
-        if !body.is_empty() {
-            let body_filtered = filter_markdown_body(body);
-            if !body_filtered.is_empty() {
-                out.push('\n');
-                for line in body_filtered.lines() {
-                    out.push_str(&format!("  {}\n", line));
-                }
+    if let Some(body) = json["body"].as_str()
+        && !body.is_empty()
+    {
+        let body_filtered = filter_markdown_body(body);
+        if !body_filtered.is_empty() {
+            out.push('\n');
+            for line in body_filtered.lines() {
+                out.push_str(&format!("  {}\n", line));
             }
+        } else {
+            out.push_str("\n  (body contained only badges/images/comments)\n");
         }
     }
 
@@ -427,42 +450,72 @@ fn format_pr_view(json: &Value, ultra_compact: bool) -> String {
 }
 
 fn pr_checks(args: &[String], _verbose: u8, _ultra_compact: bool) -> Result<i32> {
-    let (pr_number, extra_args) = match extract_identifier_and_extra_args(args) {
-        Some(result) => result,
-        None => return Err(anyhow::anyhow!("PR number required")),
-    };
+    // `gh pr checks` without an identifier defaults to the PR for the current branch.
+    let (pr_number_opt, extra_args) = parse_optional_identifier(args);
     let mut cmd = resolved_command("gh");
-    cmd.args(["pr", "checks", &pr_number]);
+    cmd.args(["pr", "checks"]);
+    if let Some(id) = pr_number_opt.as_deref() {
+        cmd.arg(id);
+    }
     for arg in &extra_args {
         cmd.arg(arg);
     }
+    let label = match pr_number_opt.as_deref() {
+        Some(id) => format!("pr checks {}", id),
+        None => "pr checks".to_string(),
+    };
     runner::run_filtered(
         cmd,
         "gh",
-        &format!("pr checks {}", pr_number),
+        &label,
         format_pr_checks,
-        RunOptions::stdout_only()
-            .early_exit_on_failure()
-            .no_trailing_newline(),
+        RunOptions::stdout_only().no_trailing_newline(),
     )
 }
 
 fn format_pr_checks(stdout: &str) -> String {
-    let mut passed = 0;
-    let mut failed = 0;
-    let mut pending = 0;
-    let mut failed_checks = Vec::new();
-
+    // `gh pr checks --watch` appends each poll's table when stdout is not a TTY.
+    // Keep the latest row for each check so status transitions are reflected
+    // without inflating the summary.
+    let mut checks: Vec<(String, String, PrCheckStatus, String)> = Vec::new();
     for line in stdout.lines() {
-        if line.contains("[ok]") || line.contains("pass") {
-            passed += 1;
-        } else if line.contains("[x]") || line.contains("fail") {
-            failed += 1;
-            failed_checks.push(line.trim().to_string());
-        } else if line.contains('*') || line.contains("pending") {
-            pending += 1;
+        let Some((name, link, status)) = parse_pr_check_line(line) else {
+            continue;
+        };
+
+        if let Some(check) = checks
+            .iter_mut()
+            .find(|check| check.0 == name && check.1 == link)
+        {
+            check.2 = status;
+            check.3 = line.trim().to_string();
+        } else {
+            checks.push((
+                name.to_string(),
+                link.to_string(),
+                status,
+                line.trim().to_string(),
+            ));
         }
     }
+
+    let passed = checks
+        .iter()
+        .filter(|check| check.2 == PrCheckStatus::Passed)
+        .count();
+    let failed = checks
+        .iter()
+        .filter(|check| check.2 == PrCheckStatus::Failed)
+        .count();
+    let pending = checks
+        .iter()
+        .filter(|check| check.2 == PrCheckStatus::Pending)
+        .count();
+
+    let other = checks
+        .iter()
+        .filter(|check| check.2 == PrCheckStatus::Other)
+        .count();
 
     let mut out = String::new();
     out.push_str("CI Checks Summary:\n");
@@ -471,13 +524,45 @@ fn format_pr_checks(stdout: &str) -> String {
     if pending > 0 {
         out.push_str(&format!("  [pending] Pending: {}\n", pending));
     }
-    if !failed_checks.is_empty() {
+    if other > 0 {
+        out.push_str(&format!("  [skip] Skipped/cancelled: {}\n", other));
+    }
+    let failed_checks = checks
+        .iter()
+        .filter(|check| check.2 == PrCheckStatus::Failed)
+        .map(|check| check.3.as_str());
+    if failed > 0 {
         out.push_str("\n  Failed checks:\n");
         for check in failed_checks {
             out.push_str(&format!("    {}\n", check));
         }
     }
     out
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PrCheckStatus {
+    Passed,
+    Failed,
+    Pending,
+    Other,
+}
+
+fn parse_pr_check_line(line: &str) -> Option<(&str, &str, PrCheckStatus)> {
+    let mut fields = line.split('\t');
+    let name = fields.next()?.trim();
+    let status = match fields.next()?.trim() {
+        "pass" => PrCheckStatus::Passed,
+        "fail" => PrCheckStatus::Failed,
+        "pending" | "*" => PrCheckStatus::Pending,
+        // skipping, cancelled, and whatever a later gh adds. Counted rather than
+        // dropped, so the totals add up to the checks gh listed and a cancelled
+        // run cannot read as "nothing wrong".
+        _ => PrCheckStatus::Other,
+    };
+    let link = fields.nth(1).unwrap_or("").trim();
+
+    (!name.is_empty()).then_some((name, link, status))
 }
 
 fn pr_status(args: &[String], _verbose: u8, _ultra_compact: bool) -> Result<i32> {
@@ -615,7 +700,9 @@ fn format_issue_list(json: &Value, ultra_compact: bool) -> String {
     if all_lines.len() > MAX_LIST {
         out.push_str(&format!("  … +{} more\n", all_lines.len() - MAX_LIST));
         let all_text = all_lines.join("\n");
-        if let Some(hint) = crate::core::tee::force_tee_tail_hint(&all_text, "gh-issues", MAX_LIST + 1) {
+        if let Some(hint) =
+            crate::core::tee::force_tee_tail_hint(&all_text, "gh-issues", MAX_LIST + 1)
+        {
             out.push_str(&format!("  {}\n", hint));
         }
     }
@@ -623,27 +710,29 @@ fn format_issue_list(json: &Value, ultra_compact: bool) -> String {
 }
 
 fn view_issue(args: &[String], _verbose: u8) -> Result<i32> {
-    let (issue_number, extra_args) = match extract_identifier_and_extra_args(args) {
-        Some(result) => result,
-        None => return Err(anyhow::anyhow!("Issue number required")),
-    };
+    // Let gh emit its own error message when the identifier is missing rather than pre-rejecting.
+    let (issue_number_opt, extra_args) = parse_optional_identifier(args);
     if should_passthrough_issue_view(&extra_args) {
-        return run_passthrough_with_extra("gh", &["issue", "view", &issue_number], &extra_args);
+        let mut base: Vec<&str> = vec!["issue", "view"];
+        if let Some(id) = issue_number_opt.as_deref() {
+            base.push(id);
+        }
+        return run_passthrough_with_extra("gh", &base, &extra_args);
     }
     let mut cmd = resolved_command("gh");
-    cmd.args([
-        "issue",
-        "view",
-        &issue_number,
-        "--json",
-        "number,title,state,author,body,url",
-    ]);
+    cmd.args(["issue", "view"]);
+    if let Some(id) = issue_number_opt.as_deref() {
+        cmd.arg(id);
+    }
+    cmd.args(["--json", "number,title,state,author,body,url"]);
     for arg in &extra_args {
         cmd.arg(arg);
     }
-    run_gh_json(cmd, &format!("issue view {}", issue_number), |json| {
-        format_issue_view(json)
-    })
+    let label = match issue_number_opt.as_deref() {
+        Some(id) => format!("issue view {}", id),
+        None => "issue view".to_string(),
+    };
+    run_gh_json(cmd, &label, format_issue_view)
 }
 
 fn format_issue_view(json: &Value) -> String {
@@ -664,15 +753,17 @@ fn format_issue_view(json: &Value) -> String {
     out.push_str(&format!("  Status: {}\n", state));
     out.push_str(&format!("  URL: {}\n", url));
 
-    if let Some(body) = json["body"].as_str() {
-        if !body.is_empty() {
-            let body_filtered = filter_markdown_body(body);
-            if !body_filtered.is_empty() {
-                out.push_str("\n  Description:\n");
-                for line in body_filtered.lines() {
-                    out.push_str(&format!("    {}\n", line));
-                }
+    if let Some(body) = json["body"].as_str()
+        && !body.is_empty()
+    {
+        let body_filtered = filter_markdown_body(body);
+        if !body_filtered.is_empty() {
+            out.push_str("\n  Description:\n");
+            for line in body_filtered.lines() {
+                out.push_str(&format!("    {}\n", line));
             }
+        } else {
+            out.push_str("\n  Description: (body contained only badges/images/comments)\n");
         }
     }
     out
@@ -753,23 +844,32 @@ fn should_passthrough_run_view(extra_args: &[String]) -> bool {
 }
 
 fn view_run(args: &[String], _verbose: u8) -> Result<i32> {
-    let (run_id, extra_args) = match extract_identifier_and_extra_args(args) {
-        Some(result) => result,
-        None => return Err(anyhow::anyhow!("Run ID required")),
-    };
+    // `gh run view` without an identifier opens an interactive picker — defer to gh.
+    let (run_id_opt, extra_args) = parse_optional_identifier(args);
     if should_passthrough_run_view(&extra_args) {
-        return run_passthrough_with_extra("gh", &["run", "view", &run_id], &extra_args);
+        let mut base: Vec<&str> = vec!["run", "view"];
+        if let Some(id) = run_id_opt.as_deref() {
+            base.push(id);
+        }
+        return run_passthrough_with_extra("gh", &base, &extra_args);
     }
     let mut cmd = resolved_command("gh");
-    cmd.args(["run", "view", &run_id]);
+    cmd.args(["run", "view"]);
+    if let Some(id) = run_id_opt.as_deref() {
+        cmd.arg(id);
+    }
     for arg in &extra_args {
         cmd.arg(arg);
     }
-    let run_id_owned = run_id.clone();
+    let label = match run_id_opt.as_deref() {
+        Some(id) => format!("run view {}", id),
+        None => "run view".to_string(),
+    };
+    let run_id_owned = run_id_opt.unwrap_or_default();
     runner::run_filtered(
         cmd,
         "gh",
-        &format!("run view {}", run_id),
+        &label,
         move |stdout| format_run_view(stdout, &run_id_owned),
         RunOptions::stdout_only()
             .early_exit_on_failure()
@@ -781,7 +881,11 @@ fn format_run_view(stdout: &str, run_id: &str) -> String {
     let mut out = String::new();
     let mut in_jobs = false;
 
-    out.push_str(&format!("Workflow Run #{}\n", run_id));
+    if run_id.is_empty() {
+        out.push_str("Workflow Run\n");
+    } else {
+        out.push_str(&format!("Workflow Run #{}\n", run_id));
+    }
     for line in stdout.lines() {
         if line.contains("JOBS") {
             in_jobs = true;
@@ -878,6 +982,11 @@ fn pr_merge(args: &[String], _verbose: u8) -> Result<i32> {
 
 /// Flags that change `gh pr diff` output from unified diff to a different format.
 /// When present, compact_diff would produce empty output since it expects diff headers.
+///
+/// `--patch` is here because GitHub's `.patch` is an mbox of `format-patch`
+/// output, not a unified diff: each patch carries a commit message, a bare
+/// `---` before the diffstat, and a `-- ` signature. Someone asking for a patch
+/// wants one that applies, so it passes through whole.
 fn has_non_diff_format_flag(args: &[String]) -> bool {
     args.iter().any(|a| {
         a == "--name-only"
@@ -885,6 +994,7 @@ fn has_non_diff_format_flag(args: &[String]) -> bool {
             || a == "--stat"
             || a == "--numstat"
             || a == "--shortstat"
+            || a == "--patch"
     })
 }
 
@@ -911,7 +1021,7 @@ fn pr_diff(args: &[String], _verbose: u8) -> Result<i32> {
             if raw.trim().is_empty() {
                 "No diff".to_string()
             } else {
-                git::compact_diff(raw, 500)
+                git_cmd::compact_diff(raw, 500)
             }
         },
         RunOptions::stdout_only().early_exit_on_failure(),
@@ -979,7 +1089,7 @@ mod tests {
         // Emoji: 🚀 = 4 bytes, 1 char
         assert_eq!(truncate("🚀🎉🔥abc", 6), "🚀🎉🔥abc"); // 6 chars, fits
         assert_eq!(truncate("🚀🎉🔥abcdef", 8), "🚀🎉🔥ab..."); // 10 chars > 8
-                                                                // Edge case: all multibyte
+        // Edge case: all multibyte
         assert_eq!(truncate("🚀🎉🔥🌟🎯", 5), "🚀🎉🔥🌟🎯"); // exact fit
         assert_eq!(truncate("🚀🎉🔥🌟🎯x", 5), "🚀🎉..."); // 6 chars > 5
     }
@@ -1077,6 +1187,103 @@ mod tests {
         assert!(extract_identifier_and_extra_args(&args).is_none());
     }
 
+    // --- format_pr_checks tests ---
+
+    #[test]
+    fn test_format_pr_checks_counts_each_watch_snapshot_once() {
+        let output = concat!(
+            "Analyze (actions)\tpass\t42s\thttps://example.com/actions\n",
+            "Analyze (rust)\tpass\t2m\thttps://example.com/rust\n",
+            "Analyze (actions)\tpass\t42s\thttps://example.com/actions\n",
+            "Analyze (rust)\tpass\t2m\thttps://example.com/rust\n",
+        );
+
+        let result = format_pr_checks(output);
+
+        assert!(result.contains("Passed: 2"));
+        assert!(!result.contains("Passed: 4"));
+    }
+
+    #[test]
+    fn test_format_pr_checks_uses_final_status_for_each_check() {
+        let output = concat!(
+            "Lint\tpending\t0\thttps://example.com/lint\n",
+            "Unit tests\tfail\t1m\thttps://example.com/unit\n",
+            "Lint\tpass\t30s\thttps://example.com/lint\n",
+            "Unit tests\tfail\t1m\thttps://example.com/unit\n",
+        );
+
+        let result = format_pr_checks(output);
+
+        assert!(result.contains("Passed: 1"));
+        assert!(result.contains("Failed: 1"));
+        assert!(!result.contains("Pending:"));
+        assert!(result.contains("Unit tests\tfail"));
+    }
+
+    #[test]
+    fn test_format_pr_checks_keeps_same_name_checks_with_different_links() {
+        let output = concat!(
+            "build\tpass\t1m\thttps://example.com/workflow-a\n",
+            "build\tfail\t1m\thttps://example.com/workflow-b\n",
+        );
+
+        let result = format_pr_checks(output);
+
+        assert!(result.contains("Passed: 1"));
+        assert!(result.contains("Failed: 1"));
+    }
+
+    /// Rows exactly as `gh` prints them when stdout is a pipe: five tab-separated
+    /// fields, the fifth (the description) usually empty. Captured from
+    /// `gh pr checks --watch` against a run that was still going, so the pending
+    /// rows here are the shape a real transition arrives in.
+    #[test]
+    fn test_format_pr_checks_handles_real_gh_row_shape() {
+        let output = concat!(
+            "test (macos-latest)\tpending\t0\thttps://example.com/job/1\t\n",
+            "clippy\tpass\t28s\thttps://example.com/job/2\t\n",
+            "license/cla\tpass\t0\thttps://cla.example.com/pr/1\tContributor License Agreement is signed.\n",
+            "test (macos-latest)\tpass\t3m1s\thttps://example.com/job/1\t\n",
+            "clippy\tpass\t28s\thttps://example.com/job/2\t\n",
+            "license/cla\tpass\t0\thttps://cla.example.com/pr/1\tContributor License Agreement is signed.\n",
+        );
+
+        let result = format_pr_checks(output);
+
+        assert!(result.contains("Passed: 3"), "got:\n{result}");
+        assert!(!result.contains("Pending:"), "got:\n{result}");
+    }
+
+    // --- parse_optional_identifier tests ---
+
+    #[test]
+    fn test_parse_optional_identifier_empty_yields_no_id() {
+        // `gh pr view` (no args) must surface as (None, []) so the caller
+        // hands the request to gh, which resolves the current branch's PR.
+        let (id, extra) = parse_optional_identifier(&[]);
+        assert!(id.is_none());
+        assert!(extra.is_empty());
+    }
+
+    #[test]
+    fn test_parse_optional_identifier_only_flags_preserves_flags() {
+        // Regression: `gh pr view -R rtk-ai/rtk` previously triggered
+        // "PR number required". Now flags must round-trip into `extra`.
+        let args: Vec<String> = vec!["-R".into(), "rtk-ai/rtk".into()];
+        let (id, extra) = parse_optional_identifier(&args);
+        assert!(id.is_none());
+        assert_eq!(extra, vec!["-R", "rtk-ai/rtk"]);
+    }
+
+    #[test]
+    fn test_parse_optional_identifier_with_id_matches_extract() {
+        let args: Vec<String> = vec!["-R".into(), "rtk-ai/rtk".into(), "42".into()];
+        let (id, extra) = parse_optional_identifier(&args);
+        assert_eq!(id.as_deref(), Some("42"));
+        assert_eq!(extra, vec!["-R", "rtk-ai/rtk"]);
+    }
+
     #[test]
     fn test_extract_identifier_with_web_flag() {
         let args: Vec<String> = vec!["123".into(), "--web".into()];
@@ -1106,6 +1313,21 @@ mod tests {
     #[test]
     fn test_run_view_no_passthrough_empty() {
         assert!(!should_passthrough_run_view(&[]));
+    }
+
+    #[test]
+    fn test_format_run_view_with_id() {
+        let output = format_run_view("", "12345");
+        assert!(output.starts_with("Workflow Run #12345\n"));
+    }
+
+    #[test]
+    fn test_format_run_view_without_id() {
+        // `gh run view` with no arg opens an interactive picker — the captured run id
+        // is empty, so the header must not render an empty `#`.
+        let output = format_run_view("", "");
+        assert!(output.starts_with("Workflow Run\n"));
+        assert!(!output.contains("#\n"));
     }
 
     #[test]
@@ -1306,6 +1528,12 @@ mod tests {
     }
 
     #[test]
+    fn test_has_non_diff_format_flag_patch() {
+        // `--patch` yields an mbox, which compact_diff has no business parsing.
+        assert!(has_non_diff_format_flag(&["--patch".into()]));
+    }
+
+    #[test]
     fn test_non_diff_format_flag_absent() {
         assert!(!has_non_diff_format_flag(&[]));
     }
@@ -1467,5 +1695,88 @@ ___
         assert!(result.contains("## Changes"));
         assert!(result.contains("## Test Plan"));
         assert!(result.contains("Filter HTML comments"));
+    }
+
+    #[test]
+    fn test_format_pr_view_body_badges_only_shows_fallback_note() {
+        // PR body that filter_markdown_body would strip entirely:
+        // HTML comments, badge links, image-only lines, horizontal rules.
+        let body = "<!-- Auto-generated by bot -->\n\
+                    [![CI](https://shields.io/badge.svg)](https://ci.example.com)\n\
+                    ![screenshot](https://example.com/img.png)\n\
+                    ---\n";
+        let json = serde_json::json!({
+            "number": 42,
+            "title": "Test PR",
+            "state": "OPEN",
+            "author": { "login": "octocat" },
+            "url": "https://github.com/foo/bar/pull/42",
+            "mergeable": "MERGEABLE",
+            "body": body,
+        });
+        let out = format_pr_view(&json, false);
+        assert!(
+            out.contains("(body contained only badges/images/comments)"),
+            "expected fallback note when body filters to empty, got:\n{}",
+            out
+        );
+    }
+
+    #[test]
+    fn test_format_pr_view_body_with_content_no_fallback_note() {
+        // Sanity check: real content should NOT trigger the fallback note.
+        let json = serde_json::json!({
+            "number": 42,
+            "title": "Test PR",
+            "state": "OPEN",
+            "author": { "login": "octocat" },
+            "url": "https://github.com/foo/bar/pull/42",
+            "mergeable": "MERGEABLE",
+            "body": "## Summary\nFix the thing.\n",
+        });
+        let out = format_pr_view(&json, false);
+        assert!(
+            !out.contains("(body contained only badges/images/comments)"),
+            "fallback note should not fire when body has real content, got:\n{}",
+            out
+        );
+        assert!(out.contains("## Summary"));
+        assert!(out.contains("Fix the thing."));
+    }
+
+    #[test]
+    fn test_format_pr_view_empty_body_no_fallback_note() {
+        // Empty body should not trigger the note either (nothing to flag).
+        let json = serde_json::json!({
+            "number": 42,
+            "title": "Test PR",
+            "state": "OPEN",
+            "author": { "login": "octocat" },
+            "url": "https://github.com/foo/bar/pull/42",
+            "mergeable": "MERGEABLE",
+            "body": "",
+        });
+        let out = format_pr_view(&json, false);
+        assert!(!out.contains("(body contained only badges/images/comments)"));
+    }
+
+    #[test]
+    fn test_format_issue_view_body_badges_only_shows_fallback_note() {
+        let body = "<!-- Auto-generated -->\n\
+                    [![status](https://shields.io/s.svg)](https://example.com)\n";
+        let json = serde_json::json!({
+            "number": 99,
+            "title": "Test Issue",
+            "state": "OPEN",
+            "author": { "login": "octocat" },
+            "url": "https://github.com/foo/bar/issues/99",
+            "body": body,
+        });
+        let out = format_issue_view(&json);
+        assert!(
+            out.contains("(body contained only badges/images/comments)"),
+            "expected fallback note when issue body filters to empty, got:\n{}",
+            out
+        );
     }
 }
